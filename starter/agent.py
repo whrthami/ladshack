@@ -31,6 +31,12 @@ def _terms(text: str) -> list[str]:
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
 
+def _stopword_hits(text: str) -> list[str]:
+    return [
+        token.lower()
+        for token in TOKEN_RE.findall(text)
+        if len(token) > 1 and token.lower() in STOPWORDS
+    ]
 
 class Agent:
     """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
@@ -84,6 +90,7 @@ class Agent:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
+        stop_words = list(dict.fromkeys(_stopword_hits(user_message))[:40])
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
             recommendations: list[dict] = []
