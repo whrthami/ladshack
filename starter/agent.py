@@ -8,7 +8,7 @@ from pathlib import Path
 
 # --- Module-level constants & regex patterns --------------------------------
 
-TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+TOKEN_RE = re.compile(r"[a-z]+|\d+(?:\.\d+)?", re.IGNORECASE)
 
 # Pure grammatical filler only — words with real intent signal (want, looking,
 # would, please) are deliberately NOT here, since _detect_intent needs them.
@@ -128,7 +128,7 @@ class Agent:
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
+            "tokenize='porter unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
@@ -185,38 +185,58 @@ class Agent:
                     slots[name] = {"value": value, "weight": self.FULL_WEIGHT}
                     matched_values.add(value.lower())
 
-        # Category has no fixed vocabulary -- only accept a candidate word
-        # if it's an actual term from the catalog's categories column, so
-        # filler like "thanks" or "sounds" never overwrites a good value.
         remaining_terms = [
             t for t in _terms(user_message)
             if t not in matched_values and t in self._category_vocab
         ]
+
         if remaining_terms:
-            candidate = max(remaining_terms, key=len)
-            slots["category"] = {"value": candidate, "weight": self.FULL_WEIGHT}
-        # else: leave slots["category"] untouched; decay still applies elsewhere
+            # Merge with whatever category terms are still warm, so adding one
+            # more descriptive word ("waterproof") narrows the category instead
+            # of replacing it outright (losing e.g. "running shoes").
+            existing = slots.get("category", {})
+            prior_terms: list[str] = []
+            if existing.get("weight", 0.0) > self.WARM_THRESHOLD and existing.get("value"):
+                prior_terms = str(existing["value"]).split()
+
+            merged_terms = list(dict.fromkeys(prior_terms + remaining_terms))
+            slots["category"] = {"value": " ".join(merged_terms), "weight": self.FULL_WEIGHT}
+
+    def _slot_terms(self, slots: dict) -> list[str]:
+        """Pull search terms from slots that are still warm enough to trust.
+
+        Without this, a follow-up message like "actually make it black" would
+        only search for "black" -- dropping prior context (category, brand)
+        that wasn't repeated in this message but hasn't decayed away yet.
+        """
+        terms: list[str] = []
+        for name in ("category", "brand", "size", "color"):
+            slot = slots.get(name, {})
+            value = slot.get("value")
+            if value and slot.get("weight", 0.0) > self.WARM_THRESHOLD:
+                terms.extend(_terms(str(value)))
+        return terms
 
     # -- retrieval routing ------------------------------------------------
 
     def _resolve_weights(self, intent: str, confidence: float, slots: dict) -> str:
-        """Column order: parent_asin, title, categories, features, details, store, description"""
+        """Indexed column order: title, categories, features, details, store, description"""
         if intent == "buying" and confidence > 0.6:
-            base = [0.0, 6.0, 3.0, 4.0, 4.0, 1.5, 0.5]
+            base = [6.0, 3.0, 4.0, 4.0, 1.5, 0.5]
         else:
-            base = [0.0, 5.0, 5.0, 2.0, 2.0, 1.5, 2.5]
+            base = [5.0, 5.0, 2.0, 2.0, 1.5, 2.5]
 
         brand_weight = slots.get("brand", {}).get("weight", 0.0)
         if brand_weight > self.WARM_THRESHOLD:
-            base[5] += 2.0 * brand_weight  # store column
+            base[4] += 2.0 * brand_weight  # store column (now index 4)
 
         attribute_weight = max(
             slots.get("size", {}).get("weight", 0.0),
             slots.get("color", {}).get("weight", 0.0),
         )
         if attribute_weight > self.WARM_THRESHOLD:
-            base[3] += 1.5 * attribute_weight  # features
-            base[4] += 1.5 * attribute_weight  # details
+            base[2] += 1.5 * attribute_weight  # features (now index 2)
+            base[3] += 1.5 * attribute_weight  # details (now index 3)
 
         return ", ".join(str(w) for w in base)
 
@@ -295,18 +315,33 @@ class Agent:
             memory["rejected_asins"].update(memory.get("last_shown", set()))
 
         # Decay every slot, then refresh whichever ones this message reinforces
+        prior_slot_values = {name: slot["value"] for name, slot in memory["slots"].items()}
         for slot in memory["slots"].values():
             slot["weight"] *= self.DECAY_RATE
         self._extract_slots(user_message, memory["slots"])
-
-        intent, confidence = _detect_intent(user_message)
-        unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
-
-        ask_attribute = self._resolve_ask_attribute(
-            user_message, unique_terms, intent, confidence, memory["slots"]
+        slot_changed_this_turn = any(
+            memory["slots"][name]["value"] != prior_slot_values[name]
+            for name in memory["slots"]
         )
 
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
+        intent, confidence = _detect_intent(user_message)
+
+        # message_terms reflects only what the user just typed -- used for the
+        # "did they give us enough to go on" heuristics (ask_attribute).
+        message_terms = list(dict.fromkeys(_terms(user_message)))[:40]
+
+        # search_terms additionally folds in still-warm slot values, so the
+        # FTS query keeps prior context (e.g. category/brand) even when the
+        # current message only mentions a changed attribute (e.g. color).
+        search_terms = list(
+            dict.fromkeys(message_terms + self._slot_terms(memory["slots"]))
+        )[:40]
+
+        ask_attribute = self._resolve_ask_attribute(
+            user_message, message_terms, intent, confidence, memory["slots"]
+        )
+
+        expression = " OR ".join(f'"{term}"' for term in search_terms)
         if not expression:
             recommendations: list[dict] = []
         else:
@@ -315,33 +350,44 @@ class Agent:
                 effective_top_k = min(effective_top_k, 3)
 
             weights = self._resolve_weights(intent, confidence, memory["slots"])
+            
+            # Prepare SQL parameters dynamically
+            params = [expression]
 
-            # Over-fetch a bit so filtering out last-shown/rejected items
-            # doesn't starve us of results.
-            rows = self.connection.execute(
+            # Filter Exclusions in SQL directly (Budget/price logic removed)
+            # Hide last-shown items to avoid immediate repeats -- but not when
+            # the user just changed a slot (e.g. red -> black), since the
+            # best match after a pivot is often something already shown.
+            repeat_guard = set() if slot_changed_this_turn else memory["last_shown"]
+            excluded = list(memory["rejected_asins"] | repeat_guard)
+            exclusion_clause = ""
+            if excluded:
+                placeholders = ",".join("?" for _ in excluded)
+                exclusion_clause = f" AND parent_asin NOT IN ({placeholders})"
+                params.extend(excluded)
+
+            params.append(effective_top_k)
+
+            query = (
                 "SELECT parent_asin, title, categories, features, details, store, description "
-                "FROM products WHERE products MATCH ? "
-                f"ORDER BY bm25(products, {weights}) LIMIT ?",
-                (expression, effective_top_k * 2),
-            ).fetchall()
+                "FROM products "
+                f"WHERE products MATCH ? {exclusion_clause} "
+                f"ORDER BY bm25(products, {weights}) LIMIT ?"
+            )
 
-            excluded = memory["rejected_asins"] | memory["last_shown"]
+            rows = self.connection.execute(query, tuple(params)).fetchall()
+
             recommendations = []
             for row in rows:
-                parent_asin = str(row[0])
-                if parent_asin in excluded:
-                    continue
-                recommendations.append(
-                    {
-                        "parent_asin": parent_asin,
-                        "title": row[1],
-                        "categories": row[2],
-                        "features": row[3],
-                        "details": row[4],
-                        "store": row[5],
-                        "description": row[6],
-                    }
-                )
+                recommendations.append({
+                    "parent_asin": str(row[0]),
+                    "title": row[1],
+                    "categories": row[2],
+                    "features": row[3],
+                    "details": row[4],
+                    "store": row[5],
+                    "description": row[6],
+                })
                 if len(recommendations) >= effective_top_k:
                     break
 
