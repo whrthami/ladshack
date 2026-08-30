@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from intent import _detect_intent
 from pathlib import Path
 
 
@@ -89,18 +90,23 @@ class Agent:
     ) -> dict:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
+        intent, confidence = _detect_intent(user_message)
         unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
-        stop_words = list(dict.fromkeys(_stopword_hits(user_message))[:40])
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
             recommendations: list[dict] = []
         else:
+            effective_top_k = self._resolve_top_k(intent, confidence, top_k)
+            weights = self._resolve_weights(intent, confidence)
             rows = self.connection.execute(
                 "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
-                (expression, top_k),
+                f"ORDER BY bm25(products, {weights}) LIMIT ?",
+                (expression, effective_top_k),
             ).fetchall()
             recommendations = [{"parent_asin": str(row[0])} for row in rows]
+
+        message = self._resolve_message(intent, recommendations)
+
         return {
             "message": "Here are the closest matches I found.",
             "ask_attribute": None,
