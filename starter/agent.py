@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from intent import _detect_intent
+from intent import (
+    _detect_intent
+    , _resolve_top_k
+    , _resolve_weights
+    , _resolve_message
+)
 from pathlib import Path
 
 
@@ -96,8 +101,8 @@ class Agent:
         if not expression:
             recommendations: list[dict] = []
         else:
-            effective_top_k = self._resolve_top_k(intent, confidence, top_k)
-            weights = self._resolve_weights(intent, confidence)
+            effective_top_k = _resolve_top_k(intent, confidence, top_k)
+            weights = _resolve_weights(intent, confidence)
             rows = self.connection.execute(
                 "SELECT parent_asin FROM products WHERE products MATCH ? "
                 f"ORDER BY bm25(products, {weights}) LIMIT ?",
@@ -105,7 +110,7 @@ class Agent:
             ).fetchall()
             recommendations = [{"parent_asin": str(row[0])} for row in rows]
 
-        message = self._resolve_message(intent, recommendations)
+        message = _resolve_message(intent, recommendations)
 
         return {
             "message": message,
