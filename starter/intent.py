@@ -63,7 +63,18 @@ def _resolve_weights(self, intent: str, confidence: float) -> str:
     # Browsing -> trust category/description more for exploratory matching
     return "0.0, 5.0, 5.0, 2.0, 2.0, 1.5, 2.5"
 
-def _resolve_message(self, intent: str, recommendations: list[dict]) -> str:
+def _resolve_message(
+    self, intent: str, ask_attribute: str | None, recommendations: list[dict]
+) -> str:
+    if ask_attribute is not None:
+        prompts = {
+            "category": "What kind of product are you looking for?",
+            "budget": "Do you have a budget in mind?",
+            "brand": "Any brand preference, or open to anything?",
+            "size": "What size are you looking for?",
+            "color": "Any color preference?",
+        }
+        return prompts.get(ask_attribute, "Could you tell me a bit more about what you need?")
     if not recommendations:
         return "I couldn't find a close match — want to tell me more about what you need?"
     if intent == "buying":

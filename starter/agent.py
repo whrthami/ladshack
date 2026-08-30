@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from ask import (
+    _resolve_ask_attribute
+)
 from intent import (
     _detect_intent
     , _resolve_top_k
@@ -97,12 +100,20 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         intent, confidence = _detect_intent(user_message)
         unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
+        ask_attribute = _resolve_ask_attribute(user_message, unique_terms, intent, confidence)
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
             recommendations: list[dict] = []
         else:
             effective_top_k = _resolve_top_k(intent, confidence, top_k)
+            # If asking question, keep results minimal
+            if ask_attribute is not None:
+                effective_top_k = min(effective_top_k, 3)
+
+            # Decides weights of search attributes using intent
             weights = _resolve_weights(intent, confidence)
+
+            # BM25 agent search
             rows = self.connection.execute(
                 "SELECT parent_asin FROM products WHERE products MATCH ? "
                 f"ORDER BY bm25(products, {weights}) LIMIT ?",
@@ -114,7 +125,7 @@ class Agent:
 
         return {
             "message": message,
-            "ask_attribute": None,
+            "ask_attribute": ask_attribute,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
