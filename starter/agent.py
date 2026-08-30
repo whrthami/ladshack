@@ -108,7 +108,7 @@ class Agent:
         message = self._resolve_message(intent, recommendations)
 
         return {
-            "message": "Here are the closest matches I found.",
+            "message": message,
             "ask_attribute": None,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
