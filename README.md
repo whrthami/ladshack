@@ -40,6 +40,16 @@ Python 3.10 or later is recommended. The starter uses only the Python standard l
 python3 -m evaluator.local_evaluator
 ```
 
+## Launch Interactive Web UI
+
+You can interact with your agent through a web interface:
+
+```bash
+python3 serve.py
+```
+
+Then open `http://localhost:8000` in your browser. The frontend includes live multi-turn chat, rich product recommendation cards, preset scenario testing, and internal state inspection.
+
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 

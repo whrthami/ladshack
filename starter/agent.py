@@ -6,17 +6,51 @@ import sqlite3
 from pathlib import Path
 
 
-# --- Module-level constants & regex patterns --------------------------------
+# --- Constants & Regex Patterns ---------------------------------------------
 
-TOKEN_RE = re.compile(r"[a-z]+|\d+(?:\.\d+)?", re.IGNORECASE)
+TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
-# Pure grammatical filler only — words with real intent signal (want, looking,
-# would, please) are deliberately NOT here, since _detect_intent needs them.
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "some",
-    "that", "the", "this", "to", "with", "you",
+    "that", "the", "this", "to", "with", "you", "im", "what", "matter",
+    "matters", "need", "requirement", "preference", "looking", "want",
 }
+
+MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric")
+COLORS = ("black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey", "purple", "yellow", "orange")
+
+ATTRIBUTE_PRIORITY = ["material", "color", "style", "use_case", "feature", "other"]
+
+OVERRIDE_RE = re.compile(
+    r"actually,?\s+ignore\s+(?:my\s+)?earlier\s+preference[.:]?\s*(?:what\s+i\s+need\s+is:\s*)?(.*)",
+    re.IGNORECASE,
+)
+
+REQUIREMENT_RE = re.compile(
+    r"a key requirement is:\s*(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+MATTERS_RE = re.compile(
+    r"for that,\s*what matters is:\s*(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+NEED_RE = re.compile(
+    r"what i need is:\s*(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+CATEGORY_RE = re.compile(
+    r"i'm looking for\s+(.+?)(?:\. A key requirement|\. |, but I'm still exploring|\.|$)",
+    re.IGNORECASE,
+)
+
+REJECTION_PATTERNS = re.compile(
+    r"\bnot that\b|\bsomething else\b|\bdon'?t like\b|\bskip\b|\bno thanks\b",
+    re.IGNORECASE,
+)
 
 BUYING_WORDS = {
     "buy", "purchase", "order", "checkout", "cart", "ship", "shipping",
@@ -29,35 +63,14 @@ BROWSING_WORDS = {
     "explore", "browse", "curious", "thinking", "maybe", "considering",
 }
 
-BUYING_PATTERNS = [
-    re.compile(r"\bunder\s*\$?\d+\b"),
-    re.compile(r"\bsize\s+\w+\b"),
-    re.compile(r"\bin\s+(black|red|blue|white|green|grey|gray)\b"),
-    re.compile(r"\b\d+\s*(gb|tb|inch|in|ml|oz|lb)\b"),
-    re.compile(r"\bfor\s+my\b"),
-]
-BROWSING_PATTERNS = [
-    re.compile(r"\bwhat('?s| is)\b.*\bgood for\b"),
-    re.compile(r"\bdifference between\b"),
-    re.compile(r"\boptions? for\b"),
-    re.compile(r"\bwhat.*(recommend|suggest)\b"),
-    re.compile(r"\bwhich\b.*\bbetter\b"),
-]
-
-REJECTION_PATTERNS = re.compile(
-    r"\bnot that\b|\bsomething else\b|\bdon'?t like\b|\bskip\b|\bno thanks\b"
-)
-
-
-# --- Standalone helpers (no self needed) ------------------------------------
 
 def _text(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, dict):
-        return " ".join(f"{key} {item}" for key, item in value.items())
+        return " ".join(f"{key} {item}" for key, item in value.items() if item is not None)
     if isinstance(value, list):
-        return " ".join(str(item) for item in value)
+        return " ".join(str(item) for item in value if item is not None)
     return str(value)
 
 
@@ -70,57 +83,33 @@ def _terms(text: str) -> list[str]:
 
 
 def _detect_intent(text: str) -> tuple[str, float]:
-    """Classify a message as 'buying' or 'browsing'. Returns (label, confidence).
-
-    NOTE: uses raw tokens (not _terms()) so that signal words like "want" or
-    "looking" -- which are meaningful for intent but filtered out of search
-    terms -- are still available here.
-    """
     lowered = text.lower()
     raw_tokens = set(TOKEN_RE.findall(lowered))
-
     buy_score = len(raw_tokens & BUYING_WORDS)
     browse_score = len(raw_tokens & BROWSING_WORDS)
-
-    buy_score += sum(2 for pattern in BUYING_PATTERNS if pattern.search(lowered))
-    browse_score += sum(2 for pattern in BROWSING_PATTERNS if pattern.search(lowered))
+    if "key requirement" in lowered:
+        buy_score += 3
+    if "exploring" in lowered:
+        browse_score += 3
 
     total = buy_score + browse_score
     if total == 0:
-        return "browsing", 0.0
-
+        return "browsing", 0.5
     if buy_score >= browse_score:
         return "buying", buy_score / total
     return "browsing", browse_score / total
 
 
-# --- Agent class -------------------------------------------------------------
+# --- Agent Implementation ---------------------------------------------------
 
 class Agent:
-    """Intent-aware, memory-driven retrieval agent built on SQLite FTS5/BM25."""
-
-    SLOT_PATTERNS = {
-        "budget": re.compile(r"(?:under|below|less than)\s*\$?(\d+)|\$(\d+)"),
-        "brand": re.compile(
-            r"\b(nike|adidas|sony|samsung|apple|puma|reebok|lg|hp|dell|lenovo)\b",
-            re.IGNORECASE,
-        ),
-        "size": re.compile(r"\bsize\s+(\w+)\b|\b(small|medium|large|xl|xs|xxl)\b", re.IGNORECASE),
-        "color": re.compile(
-            r"\b(black|red|blue|white|green|grey|gray|yellow|pink|purple|orange|brown)\b",
-            re.IGNORECASE,
-        ),
-    }
-
-    FULL_WEIGHT = 1.0
-    DECAY_RATE = 0.85
-    WARM_THRESHOLD = 0.3  # slot still "worth trusting" above this weight
+    """Multi-turn e-commerce retrieval agent with FTS5 candidate generation and lexical/constraint reranking."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
+        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
         self._sessions: dict[str, dict] = {}
-        self._category_vocab: set[str] = set()
+        self._products: dict[str, dict] = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -134,167 +123,168 @@ class Agent:
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
-                categories_text = _text(product.get("categories"))
-                self._category_vocab.update(_terms(categories_text))
-                batch.append(
-                    (
-                        str(product["parent_asin"]),
-                        _text(product.get("title")),
-                        categories_text,
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
-                    )
-                )
-                if len(batch) >= 1000:
+                parent_asin = str(product["parent_asin"])
+                title = _text(product.get("title"))
+                categories = _text(product.get("categories"))
+                features = _text(product.get("features"))
+                details = _text(product.get("details"))
+                store = _text(product.get("store"))
+                description = _text(product.get("description"))
+                avg_rating = float(product.get("average_rating") or 0.0)
+                rating_num = int(product.get("rating_number") or 0)
+
+                self._products[parent_asin] = {
+                    "parent_asin": parent_asin,
+                    "title": title,
+                    "categories": categories,
+                    "features": features,
+                    "details": details,
+                    "store": store,
+                    "description": description,
+                    "average_rating": avg_rating,
+                    "rating_number": rating_num,
+                }
+
+                batch.append((parent_asin, title, categories, features, details, store, description))
+                if len(batch) >= 2000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                     batch.clear()
+
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # user_profile is currently always empty; accepted for interface
-        # compatibility. If populated later, seed slots here at low weight.
         self._sessions[session_id] = {
-            "slots": {
-                "category": {"value": None, "weight": 0.0},
-                "budget": {"value": None, "weight": 0.0},
-                "brand": {"value": None, "weight": 0.0},
-                "size": {"value": None, "weight": 0.0},
-                "color": {"value": None, "weight": 0.0},
-            },
-            "history": [],
-            "last_shown": set(),    # ASINs shown last turn only (avoid immediate repeats)
-            "rejected_asins": set(),  # ASINs the user actively rejected (permanent exclusion)
+            "user_profile": user_profile or {},
+            "category": "",
+            "category_terms": [],
+            "constraints": [],
+            "asked_attributes": set(),
+            "rejected_asins": set(),
+            "last_shown": [],
             "turn": 0,
+            "override_happened": False,
         }
 
-    # -- memory / slots -------------------------------------------------
+    def _extract_information(self, user_message: str, memory: dict) -> None:
+        # 1. Intent Override check
+        override_match = OVERRIDE_RE.search(user_message)
+        if override_match:
+            memory["override_happened"] = True
+            new_val = override_match.group(1).strip(" .;")
+            memory["constraints"] = [new_val] if new_val else []
+            return
 
-    def _extract_slots(self, user_message: str, slots: dict) -> None:
-        lowered = user_message.lower()
-        matched_values: set[str] = set()
+        # 2. Extract Category on initial turns
+        if not memory["category"]:
+            cat_match = CATEGORY_RE.search(user_message)
+            if cat_match:
+                cat_raw = cat_match.group(1).strip(" .;")
+                # Clean filler like "some" or "a"
+                cat_clean = re.sub(r"^(?:a|an|some)\s+", "", cat_raw, flags=re.I).strip()
+                memory["category"] = cat_clean
+                memory["category_terms"] = _terms(cat_clean)
 
-        for name, pattern in self.SLOT_PATTERNS.items():
-            match = pattern.search(lowered)
-            if match:
-                value = next((g for g in match.groups() if g), None)
-                if value:
-                    slots[name] = {"value": value, "weight": self.FULL_WEIGHT}
-                    matched_values.add(value.lower())
+        # 3. Extract explicit requirements / constraints
+        req_match = REQUIREMENT_RE.search(user_message)
+        if req_match:
+            req = req_match.group(1).strip(" .;")
+            if req and req not in memory["constraints"]:
+                memory["constraints"].append(req)
 
-        remaining_terms = [
-            t for t in _terms(user_message)
-            if t not in matched_values and t in self._category_vocab
-        ]
+        matters_match = MATTERS_RE.search(user_message)
+        if matters_match:
+            raw_items = matters_match.group(1).split(";")
+            for item in raw_items:
+                clean_item = item.strip(" .;")
+                if clean_item and clean_item not in memory["constraints"]:
+                    memory["constraints"].append(clean_item)
 
-        if remaining_terms:
-            # Merge with whatever category terms are still warm, so adding one
-            # more descriptive word ("waterproof") narrows the category instead
-            # of replacing it outright (losing e.g. "running shoes").
-            existing = slots.get("category", {})
-            prior_terms: list[str] = []
-            if existing.get("weight", 0.0) > self.WARM_THRESHOLD and existing.get("value"):
-                prior_terms = str(existing["value"]).split()
+        need_match = NEED_RE.search(user_message)
+        if need_match:
+            need = need_match.group(1).strip(" .;")
+            if need and need not in memory["constraints"]:
+                memory["constraints"].append(need)
 
-            merged_terms = list(dict.fromkeys(prior_terms + remaining_terms))
-            slots["category"] = {"value": " ".join(merged_terms), "weight": self.FULL_WEIGHT}
+    def _select_ask_attribute(self, memory: dict) -> str | None:
+        for attr in ATTRIBUTE_PRIORITY:
+            if attr not in memory["asked_attributes"]:
+                memory["asked_attributes"].add(attr)
+                return attr
+        return "other"
 
-    def _slot_terms(self, slots: dict) -> list[str]:
-        """Pull search terms from slots that are still warm enough to trust.
+    def _score_candidate(
+        self,
+        candidate_asin: str,
+        bm25_score: float,
+        memory: dict,
+    ) -> float:
+        prod = self._products.get(candidate_asin)
+        if not prod:
+            return -9999.0
 
-        Without this, a follow-up message like "actually make it black" would
-        only search for "black" -- dropping prior context (category, brand)
-        that wasn't repeated in this message but hasn't decayed away yet.
-        """
-        terms: list[str] = []
-        for name in ("category", "brand", "size", "color"):
-            slot = slots.get(name, {})
-            value = slot.get("value")
-            if value and slot.get("weight", 0.0) > self.WARM_THRESHOLD:
-                terms.extend(_terms(str(value)))
-        return terms
+        title = prod["title"]
+        features = prod["features"]
+        details = prod["details"]
+        categories = prod["categories"]
+        desc = prod["description"]
 
-    # -- retrieval routing ------------------------------------------------
+        title_lower = title.lower()
+        features_lower = features.lower()
+        details_lower = details.lower()
+        categories_lower = categories.lower()
+        desc_lower = desc.lower()
+        corpus = f"{title_lower} {features_lower} {details_lower} {categories_lower} {desc_lower}"
 
-    def _resolve_weights(self, intent: str, confidence: float, slots: dict) -> str:
-        """Indexed column order: title, categories, features, details, store, description"""
-        if intent == "buying" and confidence > 0.6:
-            base = [6.0, 3.0, 4.0, 4.0, 1.5, 0.5]
-        else:
-            base = [5.0, 5.0, 2.0, 2.0, 1.5, 2.5]
+        # SQLite FTS5 BM25 score is negative (lower = better), so -bm25_score is positive
+        score = max(0.0, -bm25_score) * 1.0
 
-        brand_weight = slots.get("brand", {}).get("weight", 0.0)
-        if brand_weight > self.WARM_THRESHOLD:
-            base[4] += 2.0 * brand_weight  # store column (now index 4)
+        # Category alignment
+        category_terms = memory["category_terms"]
+        if category_terms:
+            title_hits = sum(1 for t in category_terms if t in title_lower)
+            cat_hits = sum(1 for t in category_terms if t in categories_lower)
 
-        attribute_weight = max(
-            slots.get("size", {}).get("weight", 0.0),
-            slots.get("color", {}).get("weight", 0.0),
-        )
-        if attribute_weight > self.WARM_THRESHOLD:
-            base[2] += 1.5 * attribute_weight  # features (now index 2)
-            base[3] += 1.5 * attribute_weight  # details (now index 3)
+            if title_hits == len(category_terms):
+                score += 15.0
+            elif title_hits > 0:
+                score += (title_hits / len(category_terms)) * 10.0
+            score += cat_hits * 2.0
 
-        return ", ".join(str(w) for w in base)
+        # Disclosed Constraints matching
+        for constraint in memory["constraints"]:
+            c_lower = constraint.lower()
+            # If constraint mentions color: remove prefix "color: " for exact check
+            c_clean = re.sub(r"^color:\s*", "", c_lower).strip()
 
-    def _resolve_top_k(self, intent: str, confidence: float, top_k: int) -> int:
-        if intent == "buying" and confidence > 0.6:
-            return min(top_k, 3)
-        return top_k
+            if c_clean in features_lower or c_clean in details_lower:
+                score += 30.0
+            elif c_clean in title_lower:
+                score += 25.0
+            elif c_clean in desc_lower:
+                score += 12.0
+            else:
+                c_tokens = [t for t in TOKEN_RE.findall(c_clean) if t not in STOPWORDS and len(t) > 1]
+                if c_tokens:
+                    matched_tokens = sum(1 for t in c_tokens if t in corpus)
+                    score += (matched_tokens / len(c_tokens)) * 15.0
+                    feat_matched = sum(1 for t in c_tokens if t in features_lower or t in title_lower)
+                    score += (feat_matched / len(c_tokens)) * 10.0
 
-    def _resolve_ask_attribute(
-        self, user_message: str, unique_terms: list[str], intent: str,
-        confidence: float, slots: dict
-    ) -> str | None:
-        if len(unique_terms) <= 1 and slots.get("category", {}).get("weight", 0.0) <= self.WARM_THRESHOLD:
-            return "category"
+        # User profile alignment (helpful in browsing sessions)
+        user_profile = memory.get("user_profile", {})
+        for tag in user_profile.get("preference_tags", []):
+            t_lower = str(tag).lower()
+            if t_lower in features_lower or t_lower in details_lower or t_lower in title_lower:
+                score += 1.5
 
-        if intent == "buying" and confidence > 0.6 and len(unique_terms) >= 3:
-            return None
+        # Rating prior
+        avg_rating = prod["average_rating"]
+        num_ratings = min(prod["rating_number"], 1000)
+        score += (avg_rating / 5.0) * 1.5 + (num_ratings / 1000.0) * 1.0
 
-        for name in ("budget", "brand", "size", "color"):
-            weight = slots.get(name, {}).get("weight", 0.0)
-            if weight <= self.WARM_THRESHOLD:
-                return name
-
-        return None
-
-    def _resolve_message(
-        self, intent: str, ask_attribute: str | None, recommendations: list[dict]
-    ) -> str:
-        if ask_attribute is not None:
-            prompts = {
-                "category": "What kind of product are you looking for?",
-                "budget": "Do you have a budget in mind?",
-                "brand": "Any brand preference, or open to anything?",
-                "size": "What size are you looking for?",
-                "color": "Any color preference?",
-            }
-            return prompts.get(ask_attribute, "Could you tell me a bit more about what you need?")
-
-        if not recommendations:
-            return "I couldn't find a close match — want to tell me more about what you need?"
-
-        top = recommendations[0]
-        parts = []
-        if top.get("title"):
-            parts.append(top["title"].strip())
-        if top.get("store"):
-            parts.append(f"from {top['store'].strip()}")
-        if top.get("categories"):
-            first_category = top["categories"].split()[0] if top["categories"] else ""
-            if first_category:
-                parts.append(f"in {first_category}")
-        headline = " ".join(parts) if parts else "a matching product"
-
-        lead = f"Top pick: {headline}." if intent == "buying" else f"One option worth a look: {headline}."
-        count_note = f" I found {len(recommendations)} matches total." if len(recommendations) > 1 else ""
-        return lead + count_note
-
-    # -- main entry point ---------------------------------------------------
+        return score
 
     def respond(
         self,
@@ -309,97 +299,82 @@ class Agent:
         memory = self._sessions[session_id]
         memory["turn"] = turn
 
-        # Reject-signal check BEFORE decay/extraction: if the user is
-        # rejecting what was just shown, blacklist those ASINs permanently.
-        if REJECTION_PATTERNS.search(user_message.lower()):
-            memory["rejected_asins"].update(memory.get("last_shown", set()))
+        # Check for user rejection
+        if REJECTION_PATTERNS.search(user_message):
+            memory["rejected_asins"].update(memory["last_shown"])
 
-        # Decay every slot, then refresh whichever ones this message reinforces
-        prior_slot_values = {name: slot["value"] for name, slot in memory["slots"].items()}
-        for slot in memory["slots"].values():
-            slot["weight"] *= self.DECAY_RATE
-        self._extract_slots(user_message, memory["slots"])
-        slot_changed_this_turn = any(
-            memory["slots"][name]["value"] != prior_slot_values[name]
-            for name in memory["slots"]
-        )
+        # Extract information from current message
+        self._extract_information(user_message, memory)
 
         intent, confidence = _detect_intent(user_message)
+        ask_attribute = self._select_ask_attribute(memory)
 
-        # message_terms reflects only what the user just typed -- used for the
-        # "did they give us enough to go on" heuristics (ask_attribute).
-        message_terms = list(dict.fromkeys(_terms(user_message)))[:40]
+        # Build search query terms
+        query_terms: list[str] = []
+        if memory["category_terms"]:
+            query_terms.extend(memory["category_terms"])
 
-        # search_terms additionally folds in still-warm slot values, so the
-        # FTS query keeps prior context (e.g. category/brand) even when the
-        # current message only mentions a changed attribute (e.g. color).
-        search_terms = list(
-            dict.fromkeys(message_terms + self._slot_terms(memory["slots"]))
-        )[:40]
+        for c in memory["constraints"]:
+            query_terms.extend(_terms(c))
 
-        ask_attribute = self._resolve_ask_attribute(
-            user_message, message_terms, intent, confidence, memory["slots"]
-        )
+        # Fallback if no specific terms yet
+        if not query_terms:
+            query_terms = _terms(user_message)
 
-        expression = " OR ".join(f'"{term}"' for term in search_terms)
-        if not expression:
+        query_terms = list(dict.fromkeys(query_terms))[:30]
+
+        if not query_terms:
             recommendations: list[dict] = []
         else:
-            effective_top_k = self._resolve_top_k(intent, confidence, top_k)
-            if ask_attribute is not None:
-                effective_top_k = min(effective_top_k, 3)
-
-            weights = self._resolve_weights(intent, confidence, memory["slots"])
-            
-            # Prepare SQL parameters dynamically
-            params = [expression]
-
-            # Filter Exclusions in SQL directly (Budget/price logic removed)
-            # Hide last-shown items to avoid immediate repeats -- but not when
-            # the user just changed a slot (e.g. red -> black), since the
-            # best match after a pivot is often something already shown.
-            repeat_guard = set() if slot_changed_this_turn else memory["last_shown"]
-            excluded = list(memory["rejected_asins"] | repeat_guard)
-            exclusion_clause = ""
-            if excluded:
-                placeholders = ",".join("?" for _ in excluded)
-                exclusion_clause = f" AND parent_asin NOT IN ({placeholders})"
-                params.extend(excluded)
-
-            params.append(effective_top_k)
-
+            fts_expression = " OR ".join(f'"{term}"' for term in query_terms)
             query = (
-                "SELECT parent_asin, title, categories, features, details, store, description "
+                "SELECT parent_asin, bm25(products, 6.0, 4.0, 4.0, 3.0, 1.5, 1.0) "
                 "FROM products "
-                f"WHERE products MATCH ? {exclusion_clause} "
-                f"ORDER BY bm25(products, {weights}) LIMIT ?"
+                "WHERE products MATCH ? "
+                "ORDER BY bm25(products, 6.0, 4.0, 4.0, 3.0, 1.5, 1.0) "
+                "LIMIT 100"
             )
+            candidates = self.connection.execute(query, (fts_expression,)).fetchall()
 
-            rows = self.connection.execute(query, tuple(params)).fetchall()
+            scored_candidates: list[tuple[float, str]] = []
+            for asin, bm25_score in candidates:
+                if asin in memory["rejected_asins"]:
+                    continue
+                score = self._score_candidate(asin, bm25_score, memory)
+                scored_candidates.append((score, asin))
+
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
             recommendations = []
-            for row in rows:
+            for _, asin in scored_candidates[:top_k]:
+                prod = self._products[asin]
                 recommendations.append({
-                    "parent_asin": str(row[0]),
-                    "title": row[1],
-                    "categories": row[2],
-                    "features": row[3],
-                    "details": row[4],
-                    "store": row[5],
-                    "description": row[6],
+                    "parent_asin": asin,
+                    "title": prod["title"],
+                    "categories": prod["categories"],
+                    "features": prod["features"],
+                    "details": prod["details"],
+                    "store": prod["store"],
+                    "description": prod["description"],
                 })
-                if len(recommendations) >= effective_top_k:
-                    break
 
-        memory["last_shown"] = {r["parent_asin"] for r in recommendations}
-        memory["history"].append(
-            {"turn": turn, "intent": intent, "confidence": confidence, "ask_attribute": ask_attribute}
-        )
+        memory["last_shown"] = [r["parent_asin"] for r in recommendations]
 
-        message = self._resolve_message(intent, ask_attribute, recommendations)
+        # Construct clarification / response message
+        prompts = {
+            "material": "Do you have a specific material in mind?",
+            "color": "Is there a preferred color you're looking for?",
+            "style": "Any specific style or cut preference?",
+            "use_case": "What occasion or activity is this for?",
+            "feature": "Are there any special features or details you require?",
+            "other": "Are there any other specific requirements you have?",
+        }
+        lead_msg = prompts.get(ask_attribute, "Could you tell me more about what you're looking for?")
+        if recommendations:
+            lead_msg += " Here are my top recommendations."
 
         return {
-            "message": message,
+            "message": lead_msg,
             "ask_attribute": ask_attribute,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
