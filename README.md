@@ -1,111 +1,198 @@
-# TechJam Conversational E-Commerce Search Challenge
+# Multi-Turn E-Commerce Retrieval & Recommendation Agent
 
-Build an AI shopping agent that asks useful follow-up questions and recommends the customer's hidden target product within at most 10 turns.
+A lightweight, high-performance multi-turn e-commerce recommendation and retrieval agent built in Python. The agent leverages **SQLite FTS5** for fast full-text candidate retrieval and applies custom heuristic constraint tracking, intent detection, and multi-factor re-ranking to deliver highly relevant product recommendations over multi-turn conversational interactions.
 
-## What You Receive
+---
 
-- A frozen catalog of 50,000 products from the `Clothing_Shoes_and_Jewelry` category of Amazon Reviews 2023.
-- 200 labeled public sessions for local development.
-- A weak BM25 starter agent and deterministic local evaluator.
-- The Agent API contract and scoring rules.
+## Key Features
 
-The organizer keeps 800 additional sessions private for final evaluation.
+* **Fast SQLite FTS5 Indexing**: In-memory SQLite database utilizing FTS5 full-text search with Porter stemming, unicode tokenization, and field-weighted BM25 scoring.
+* **Conversational Context Tracking**: Maintains per-session memory across turns, tracking categories, explicit user constraints, negative rejections, and past recommendations.
+* **Constraint & Requirement Extraction**: Automatically parses explicit user constraints (e.g., material, color, specific feature requirements, and complete preference overrides) using targeted pattern matching.
+* **Intent Detection**: Classifies user queries into `browsing` or `buying` intents using lexical signals and confidence scoring.
+* **Smart Reranking Pipeline**: Reranks top FTS candidate products by combining:
+  * Weighted BM25 catalog match scores.
+  * Category alignment heuristics.
+  * Disclosed constraint satisfaction across product fields (title, features, details, description).
+  * User profile tag preferences.
+  * Product rating priors (average rating & review counts).
+* **Interactive Clarification System**: Dynamically selects prioritized attributes (`material`, `color`, `style`, `use_case`, `feature`, `other`) to ask follow-up questions and narrow down candidate sets.
+* **Zero Heavy Dependencies**: Pure Python standard library implementation (`sqlite3`, `json`, `re`, `pathlib`).
 
-## Task
+---
 
-For each session, your agent receives an anonymized preference profile and a short customer message. Raw user IDs, review text, timestamps, and purchase history are never disclosed. On every turn the agent may:
+## Architecture & Workflow
 
-- ask a natural clarification question in `message` and identify one requested field in `ask_attribute`;
-- return a ranked list of up to 10 catalog `parent_asin` values;
-- do both in the same response.
-
-The session ends when the target product appears in the scored Top 10 or after turn 10. Sessions cover Buying, Browsing, Intent Override, and Boundary behavior.
-
-## Download the Catalog
-
-Download `catalog.jsonl.gz` from the GitHub Release attached to this repository, then run:
-
-```bash
-gzip -dk catalog.jsonl.gz
-mv catalog.jsonl data/catalog.jsonl
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           User Message Input                            │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │ 1. Context & Constraint Parser│
+                     └───────────────┬───────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │   2. Dynamic Intent & Query   │
+                     │          Builder              │
+                     └───────────────┬───────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │  3. SQLite FTS5 Candidate     │
+                     │      Retrieval (BM25)         │
+                     └───────────────┬───────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │  4. Reranking & Constraint    │
+                     │         Scoring Engine        │
+                     └───────────────┬───────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│               Top-K Recommendations & Follow-up Prompt                  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Verify the downloaded file using the published `SHA256SUMS` file.
+---
 
-## Run the Starter
+## Data Model
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+The agent expects catalog data in **JSON Lines (`.jsonl`)** format at `data/catalog.jsonl` (or a custom path). Each line represents a JSON object with the following schema:
 
-```bash
-python3 -m evaluator.local_evaluator
+```json
+{
+  "parent_asin": "B08N5WRWNW",
+  "title": "Men's Cotton Casual Crewneck T-Shirt",
+  "categories": "Clothing, Shoes & Jewelry > Men > Shirts",
+  "features": "100% Breathable Cotton, Pre-shrunk fabric, Ribbed collar",
+  "details": "Material: Cotton, Fit: Regular",
+  "store": "Apparel Brand",
+  "description": "A classic daily wear t-shirt designed for maximum comfort.",
+  "average_rating": 4.5,
+  "rating_number": 320
+}
 ```
 
-Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
-The command writes per-session results and aggregate metrics to `results.json`.
+---
 
-The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
-MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
+## Installation & Requirements
 
-## Agent Interface
+* **Python Version**: Python 3.8+ (Supports Python 3.10+ type annotations).
+* **Dependencies**: Python Standard Library only (`sqlite3` built with FTS5 support, standard in modern Python distributions).
+
+No external PyPI packages are required.
+
+---
+
+## Getting Started
+
+### 1. Catalog Setup
+
+Place your product catalog file formatted as `.jsonl` inside the `data/` directory (e.g., `data/catalog.jsonl`).
+
+### 2. Quick Usage Example
 
 ```python
-class Agent:
-    def reset(self, session_id: str, user_profile: dict) -> None:
-        ...
+from agent import Agent
 
-    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
-        return {
-            "message": "Do you have a material preference?",
-            "ask_attribute": "material",
-            "recommendations": [
-                {"parent_asin": "B000..."},
-                {"parent_asin": "B001..."}
-            ],
-            "usage": {"prompt_tokens": 120, "completion_tokens": 30}
-        }
+# Initialize the agent and load/index the catalog
+agent = Agent(catalog_path="data/catalog.jsonl")
+
+# Initialize session state for a user session
+session_id = "user_session_001"
+user_profile = {
+    "preference_tags": ["cotton", "breathable", "casual"]
+}
+
+agent.reset(session_id=session_id, user_profile=user_profile)
+
+# Turn 1: Initial broad query
+response_1 = agent.respond(
+    session_id=session_id,
+    user_message="I'm looking for a jacket. A key requirement is: waterproof.",
+    turn=1,
+    top_k=3
+)
+
+print(f"Agent Prompt: {response_1['message']}")
+print("Recommendations:")
+for item in response_1["recommendations"]:
+    print(f" - {item['title']} (ASIN: {item['parent_asin']})")
+
+# Turn 2: User adds specific requirement
+response_2 = agent.respond(
+    session_id=session_id,
+    user_message="What I need is: black.",
+    turn=2,
+    top_k=3
+)
+
+print(f"\nAgent Prompt: {response_2['message']}")
+print("Updated Recommendations:")
+for item in response_2["recommendations"]:
+    print(f" - {item['title']} (ASIN: {item['parent_asin']})")
 ```
 
-`ask_attribute` is one of `category`, `material`, `color`, `size`, `style`, `brand`, `budget`, `feature`, `use_case`, `other`, or `null`. See `docs/agent_api_contract.json`.
+---
 
-## Technical Metrics
+## API Reference
 
-- **Hit Rate@10:** fraction of sessions that find the target within 10 turns.
-- **MRR:** mean reciprocal rank of the target; a miss contributes zero.
-- **MTTC:** mean first-hit turn; a miss is assigned turn 11.
-- **Reported token usage:** prompt and completion tokens returned by the team's model client.
+### `Agent(catalog_path: str | Path = "data/catalog.jsonl")`
+Instantiates the agent, initializes the in-memory SQLite database, creates the FTS5 table, and indexes products from the JSONL catalog.
 
-```text
-TechnicalScore = 0.50 × HitRate@10 + 0.30 × MRR + 0.20 × Efficiency
-Efficiency = clip((11 - MTTC) / 10, 0, 1)
+### `Agent.reset(session_id: str, user_profile: dict) -> None`
+Resets memory and state for a specific session ID, including constraints, rejected ASINs, category terms, and asked attributes.
+
+### `Agent.respond(session_id: str, user_message: str, turn: int, top_k: int) -> dict`
+Processes a turn of user interaction.
+
+#### Parameters:
+* **`session_id`** (`str`): Unique identifier for the active session.
+* **`user_message`** (`str`): The raw text message sent by the user.
+* **`turn`** (`int`): Current conversation turn number.
+* **`top_k`** (`int`): Number of recommended items to return.
+
+#### Returns (`dict`):
+```json
+{
+  "message": "Do you have a specific material in mind? Here are my top recommendations.",
+  "ask_attribute": "material",
+  "recommendations": [
+    {
+      "parent_asin": "B08N5WRWNW",
+      "title": "...",
+      "categories": "...",
+      "features": "...",
+      "details": "...",
+      "store": "...",
+      "description": "..."
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}
 ```
 
-Only exact `parent_asin` equality produces a hit. Core metrics are also reported by scenario.
+---
 
-## Model Choice and Cost
+## Pattern Matching & Extraction Rules
 
-Teams may use any legally accessible LLM API or local model. Teams manage their own credentials and must never commit API keys. Model choice, estimated cost, token usage, and latency must be disclosed. Token usage is a feasibility metric, not part of the core technical score. The organizer may reimburse model costs through prizes instead of issuing API keys.
+The agent parses explicit natural language phrases to refine retrieval:
 
-## Files
+* **Category Identification**: Matches `i'm looking for <category>`.
+* **Explicit Requirements**: Matches `a key requirement is: <requirement>`.
+* **Details & Specifics**: Matches `for that, what matters is: <item1>; <item2>` or `what i need is: <need>`.
+* **Preference Overrides**: Detects phrases like `actually, ignore my earlier preference` to purge prior constraints.
+* **Negative Feedback**: Detects rejection triggers like `not that`, `don't like`, or `skip`, adding previously shown ASINs to the session rejection set.
 
-```text
-data/public_set.jsonl             200 labeled development sessions
-docs/competition_specification.md participant rules and evaluation protocol
-docs/agent_api_contract.json      machine-readable Agent contract
-docs/evaluation_config.json       scoring configuration
-docs/baseline_results.json        reproducible weak-starter reference score
-starter/agent.py                  editable weak starter
-evaluator/local_evaluator.py      public-set simulator and scorer
-```
+---
 
-## Judging and Submission Policy
+## License
 
-- Participant submission requirements: `docs/submission_rules.md`
-- Participant release checklist: `docs/participant_release_checklist.md`
-- Organizer-only final judging controls: `organizer/JUDGING_RUNBOOK.md`
-- Organizer private release checklist: `organizer/private_release_checklist.md`
-- Judging day operations SOP: `organizer/JUDGING_DAY_SOP.md`
-
-## Data Source
-
-The catalog and sessions are derived from Amazon Reviews 2023 by McAuley Lab, UCSD. See `DATA_ATTRIBUTION.md` before using or redistributing the data.
-Sessions are sampled deterministically from the official Clothing 5-core leave-last-out split and joined to the frozen catalog.
+This project is licensed under the MIT License - see the LICENSE file for details.
